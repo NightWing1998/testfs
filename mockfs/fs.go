@@ -1,4 +1,5 @@
-// Package mockfs provides a minimal in-memory filesystem served over FUSE for testing code that reacts to filesystem events.
+// Package mockfs provides a minimal in-memory filesystem served over FUSE for testing code that
+// reacts to filesystem events.
 package mockfs
 
 import (
@@ -445,13 +446,22 @@ func (fs *MockFS) rename(oldPath, newPath string) error {
 
 	fs.logTrace("rename start", slog.String("old_path", oldPath), slog.String("new_path", newPath))
 	if err, ok := fs.errors[EventRename]; ok {
-		fs.logDebug("rename error injected", slog.String("old_path", oldPath), slog.String("new_path", newPath), slog.Any("error", err))
+		fs.logDebug(
+			"rename error injected",
+			slog.String("old_path", oldPath),
+			slog.String("new_path", newPath),
+			slog.Any("error", err),
+		)
 		return err
 	}
 
 	oldParent, oldName, err := fs.ensureParent(oldPath)
 	if err != nil {
-		fs.logDebug("rename old ensureParent failed", slog.String("old_path", oldPath), slog.Any("error", err))
+		fs.logDebug(
+			"rename old ensureParent failed",
+			slog.String("old_path", oldPath),
+			slog.Any("error", err),
+		)
 		return err
 	}
 	target, ok := oldParent.children[oldName]
@@ -462,7 +472,11 @@ func (fs *MockFS) rename(oldPath, newPath string) error {
 
 	newParent, newName, err := fs.ensureParent(newPath)
 	if err != nil {
-		fs.logDebug("rename new ensureParent failed", slog.String("new_path", newPath), slog.Any("error", err))
+		fs.logDebug(
+			"rename new ensureParent failed",
+			slog.String("new_path", newPath),
+			slog.Any("error", err),
+		)
 		return err
 	}
 	if !newParent.isDir() {
@@ -480,7 +494,11 @@ func (fs *MockFS) rename(oldPath, newPath string) error {
 	newParent.children[newName] = target
 	oldParent.mtime = time.Now()
 	newParent.mtime = time.Now()
-	fs.logTrace("rename success", slog.String("old_path", oldPath), slog.String("new_path", newPath))
+	fs.logTrace(
+		"rename success",
+		slog.String("old_path", oldPath),
+		slog.String("new_path", newPath),
+	)
 	return nil
 }
 
@@ -503,7 +521,11 @@ func (fs *MockFS) readFile(n *node, offset int64, size int) ([]byte, error) {
 	}
 
 	if offset > int64(len(n.data)) {
-		fs.logDebug("readFile offset beyond end", slog.Int64("offset", offset), slog.Int("length", len(n.data)))
+		fs.logDebug(
+			"readFile offset beyond end",
+			slog.Int64("offset", offset),
+			slog.Int("length", len(n.data)),
+		)
 		return []byte{}, nil
 	}
 	end := offset + int64(size)

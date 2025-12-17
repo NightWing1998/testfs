@@ -23,7 +23,9 @@ func playWithFS() {
 		}
 	}()
 	fs := mockfs.New()
-	fs.SetLogger(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: mockfs.LevelTrace})))
+	fs.SetLogger(
+		slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: mockfs.LevelTrace})),
+	)
 	if err := fs.Mount(context.Background(), path); err != nil {
 		log.Fatalf("mount failed: %v", err)
 	}
@@ -32,7 +34,15 @@ func playWithFS() {
 	// Observe filesystem activity.
 	go func() {
 		for ev := range fs.Events() {
-			log.Printf("event=%s path=%s size=%d from=%s error=%v errno=%d", ev.Type, ev.Path, ev.Size, ev.OldPath, ev.Error, ev.Errno)
+			log.Printf(
+				"event=%s path=%s size=%d from=%s error=%v errno=%d",
+				ev.Type,
+				ev.Path,
+				ev.Size,
+				ev.OldPath,
+				ev.Error,
+				ev.Errno,
+			)
 		}
 	}()
 

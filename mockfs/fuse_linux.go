@@ -302,7 +302,10 @@ func (fs *MockFS) Close() error {
 		// 3. There's a race condition in the C code
 		// We proceed anyway to avoid deadlock, but log this condition
 		// Note: This may leak resources if the loop is truly stuck
-		fs.logError("fuse loop did not exit before timeout; forcing shutdown", slog.String("mountpoint", fm.mountpoint))
+		fs.logError(
+			"fuse loop did not exit before timeout; forcing shutdown",
+			slog.String("mountpoint", fm.mountpoint),
+		)
 	}
 
 	C.mockfs_destroy(fm.native)
@@ -317,8 +320,14 @@ func handleToFS(h C.uint64_t) *MockFS {
 	return cgo.Handle(uintptr(h)).Value().(*MockFS)
 }
 
+//
 //export go_getattr
-func go_getattr(path *C.char, stbuf *C.struct_stat, fi *C.struct_fuse_file_info, handle C.uint64_t) C.int {
+func go_getattr(
+	path *C.char,
+	stbuf *C.struct_stat,
+	fi *C.struct_fuse_file_info,
+	handle C.uint64_t,
+) C.int {
 	_ = fi
 	fs := handleToFS(handle)
 	goPath := C.GoString(path)
@@ -333,8 +342,17 @@ func go_getattr(path *C.char, stbuf *C.struct_stat, fi *C.struct_fuse_file_info,
 	return 0
 }
 
+//
 //export go_readdir
-func go_readdir(path *C.char, buf unsafe.Pointer, filler C.fuse_fill_dir_t, offset C.off_t, fi *C.struct_fuse_file_info, flags C.enum_fuse_readdir_flags, handle C.uint64_t) C.int {
+func go_readdir(
+	path *C.char,
+	buf unsafe.Pointer,
+	filler C.fuse_fill_dir_t,
+	offset C.off_t,
+	fi *C.struct_fuse_file_info,
+	flags C.enum_fuse_readdir_flags,
+	handle C.uint64_t,
+) C.int {
 	_ = fi
 	_ = offset
 	_ = flags
@@ -390,11 +408,25 @@ func go_release(path *C.char, fi *C.struct_fuse_file_info, handle C.uint64_t) C.
 	return 0
 }
 
+//
 //export go_read
-func go_read(path *C.char, buf *C.char, size C.size_t, offset C.off_t, fi *C.struct_fuse_file_info, handle C.uint64_t) C.int {
+func go_read(
+	path *C.char,
+	buf *C.char,
+	size C.size_t,
+	offset C.off_t,
+	fi *C.struct_fuse_file_info,
+	handle C.uint64_t,
+) C.int {
 	fs := handleToFS(handle)
 	goPath := C.GoString(path)
-	fs.logTrace("go_read start", slog.String("path", goPath), slog.Int("size", int(size)), slog.Int64("offset", int64(offset)), slog.Uint64("fh", uint64(fi.fh)))
+	fs.logTrace(
+		"go_read start",
+		slog.String("path", goPath),
+		slog.Int("size", int(size)),
+		slog.Int64("offset", int64(offset)),
+		slog.Uint64("fh", uint64(fi.fh)),
+	)
 	var n *node
 	if fhNode, ok := fs.handleNode(uint64(fi.fh)); ok {
 		n = fhNode
@@ -419,15 +451,34 @@ func go_read(path *C.char, buf *C.char, size C.size_t, offset C.off_t, fi *C.str
 		C.memcpy(unsafe.Pointer(buf), unsafe.Pointer(&data[0]), C.size_t(len(data)))
 	}
 	fs.emit(Event{Type: EventRead, Path: goPath, Size: int64(len(data))})
-	fs.logTrace("go_read success", slog.String("path", goPath), slog.Int("read", len(data)), slog.Uint64("fh", uint64(fi.fh)))
+	fs.logTrace(
+		"go_read success",
+		slog.String("path", goPath),
+		slog.Int("read", len(data)),
+		slog.Uint64("fh", uint64(fi.fh)),
+	)
 	return C.int(len(data))
 }
 
+//
 //export go_write
-func go_write(path *C.char, cbuf *C.char, size C.size_t, offset C.off_t, fi *C.struct_fuse_file_info, handle C.uint64_t) C.int {
+func go_write(
+	path *C.char,
+	cbuf *C.char,
+	size C.size_t,
+	offset C.off_t,
+	fi *C.struct_fuse_file_info,
+	handle C.uint64_t,
+) C.int {
 	fs := handleToFS(handle)
 	goPath := C.GoString(path)
-	fs.logTrace("go_write start", slog.String("path", goPath), slog.Int("size", int(size)), slog.Int64("offset", int64(offset)), slog.Uint64("fh", uint64(fi.fh)))
+	fs.logTrace(
+		"go_write start",
+		slog.String("path", goPath),
+		slog.Int("size", int(size)),
+		slog.Int64("offset", int64(offset)),
+		slog.Uint64("fh", uint64(fi.fh)),
+	)
 	var n *node
 	if fhNode, ok := fs.handleNode(uint64(fi.fh)); ok {
 		n = fhNode
@@ -450,7 +501,12 @@ func go_write(path *C.char, cbuf *C.char, size C.size_t, offset C.off_t, fi *C.s
 		return -errno
 	}
 	fs.emit(Event{Type: EventWrite, Path: goPath, Size: int64(written)})
-	fs.logTrace("go_write success", slog.String("path", goPath), slog.Int("written", written), slog.Uint64("fh", uint64(fi.fh)))
+	fs.logTrace(
+		"go_write success",
+		slog.String("path", goPath),
+		slog.Int("written", written),
+		slog.Uint64("fh", uint64(fi.fh)),
+	)
 	return C.int(written)
 }
 
@@ -536,8 +592,15 @@ func go_rename(oldpath *C.char, newpath *C.char, flags C.uint, handle C.uint64_t
 	fs.logTrace("go_rename start", slog.String("old_path", oldGo), slog.String("new_path", newGo))
 	if err := fs.rename(oldGo, newGo); err != nil {
 		errno := errnoFrom(err)
-		fs.emit(Event{Type: EventRename, Path: newGo, OldPath: oldGo, Error: err, Errno: int(errno)})
-		fs.logDebug("go_rename failed", slog.String("old_path", oldGo), slog.String("new_path", newGo), slog.Any("error", err))
+		fs.emit(
+			Event{Type: EventRename, Path: newGo, OldPath: oldGo, Error: err, Errno: int(errno)},
+		)
+		fs.logDebug(
+			"go_rename failed",
+			slog.String("old_path", oldGo),
+			slog.String("new_path", newGo),
+			slog.Any("error", err),
+		)
 		return -errno
 	}
 	fs.emit(Event{Type: EventRename, Path: newGo, OldPath: oldGo})
@@ -553,7 +616,15 @@ func go_truncate(path *C.char, size C.off_t, fi *C.struct_fuse_file_info, handle
 	fs.logTrace("go_truncate start", slog.String("path", goPath), slog.Int64("size", int64(size)))
 	if err := fs.truncate(goPath, int64(size)); err != nil {
 		errno := errnoFrom(err)
-		fs.emit(Event{Type: EventTruncate, Path: goPath, Size: int64(size), Error: err, Errno: int(errno)})
+		fs.emit(
+			Event{
+				Type:  EventTruncate,
+				Path:  goPath,
+				Size:  int64(size),
+				Error: err,
+				Errno: int(errno),
+			},
+		)
 		fs.logDebug("go_truncate failed", slog.String("path", goPath), slog.Any("error", err))
 		return -errno
 	}
@@ -606,7 +677,12 @@ func go_statfs(path *C.char, st *C.struct_statvfs, handle C.uint64_t) C.int {
 	st.f_ffree = ffree
 	st.f_namemax = 255
 
-	fs.logTrace("go_statfs success", slog.String("path", goPath), slog.Int64("blocks", int64(blocks)), slog.Int64("files", int64(files)))
+	fs.logTrace(
+		"go_statfs success",
+		slog.String("path", goPath),
+		slog.Int64("blocks", int64(blocks)),
+		slog.Int64("files", int64(files)),
+	)
 	return 0
 }
 
