@@ -294,6 +294,7 @@ func (fs *MockFS) Close() error {
 	select {
 	case <-fm.loopCh:
 		// Loop exited normally
+		fs.logInfo("mockfs closed", slog.String("mountpoint", fm.mountpoint))
 	case <-time.After(5 * time.Second):
 		// Loop didn't exit in time - this could indicate:
 		// 1. mockfs_exit didn't properly signal the loop
@@ -308,7 +309,6 @@ func (fs *MockFS) Close() error {
 	fm.handle.Delete()
 	close(fs.events)
 	fs.platformData = nil
-	fs.logInfo("mockfs closed", slog.String("mountpoint", fm.mountpoint))
 	close(fs.logCh)
 	return nil
 }
