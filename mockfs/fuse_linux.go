@@ -1,6 +1,7 @@
 //go:build linux
 // +build linux
 
+// Package mockfs provides the Linux FUSE-backed mock filesystem implementation.
 package mockfs
 
 /*
@@ -188,19 +189,22 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"runtime/cgo"
 	"strings"
 	"sync"
+	"time"
 	"unsafe"
 )
 
 type fuseMount struct {
-	handle  cgo.Handle
-	native  *C.struct_mockfs_handle
-	loopCh  chan struct{}
-	closeMu sync.Mutex
-	closed  bool
+	handle     cgo.Handle
+	native     *C.struct_mockfs_handle
+	mountpoint string
+	loopCh     chan struct{}
+	closeMu    sync.Mutex
+	closed     bool
 }
 
 // Mount mounts the mock filesystem at the given mountpoint and starts serving
@@ -208,12 +212,17 @@ type fuseMount struct {
 // context may be used to request unmount; canceling the context will trigger
 // a clean shutdown.
 func (fs *MockFS) Mount(ctx context.Context, mountpoint string) error {
+	go fs.logLoop()
+
 	fs.mountMu.Lock()
 	defer fs.mountMu.Unlock()
 
 	if _, ok := fs.platformData.(*fuseMount); ok {
+		fs.logError("mount requested but already mounted", slog.String("mountpoint", mountpoint))
 		return fmt.Errorf("mockfs is already mounted")
 	}
+
+	fs.logInfo("mounting mockfs", slog.String("mountpoint", mountpoint))
 
 	h := cgo.NewHandle(fs)
 	cMount := C.CString(mountpoint)
@@ -230,18 +239,22 @@ func (fs *MockFS) Mount(ctx context.Context, mountpoint string) error {
 		if errStr != nil {
 			msg = fmt.Sprintf("%s: %s", msg, C.GoString(errStr))
 		}
+		fs.logError(msg, slog.String("mountpoint", mountpoint))
 		return errors.New(msg)
 	}
 
 	m := &fuseMount{
-		handle: h,
-		native: native,
-		loopCh: make(chan struct{}),
+		handle:     h,
+		native:     native,
+		mountpoint: mountpoint,
+		loopCh:     make(chan struct{}),
 	}
 	fs.platformData = m
+	fs.logInfo("mockfs mounted", slog.String("mountpoint", mountpoint))
 
 	go func() {
 		C.mockfs_loop(native)
+		fs.logInfo("fuse loop exited", slog.String("mountpoint", mountpoint))
 		close(m.loopCh)
 	}()
 
@@ -272,12 +285,31 @@ func (fs *MockFS) Close() error {
 	fm.closed = true
 	fm.closeMu.Unlock()
 
+	fs.logInfo("closing mockfs", slog.String("mountpoint", fm.mountpoint))
+
+	// Signal FUSE to exit
 	C.mockfs_exit(fm.native)
-	<-fm.loopCh
+
+	// Wait for the loop to exit with a timeout to prevent indefinite blocking
+	select {
+	case <-fm.loopCh:
+		// Loop exited normally
+	case <-time.After(5 * time.Second):
+		// Loop didn't exit in time - this could indicate:
+		// 1. mockfs_exit didn't properly signal the loop
+		// 2. The loop is blocked on an operation
+		// 3. There's a race condition in the C code
+		// We proceed anyway to avoid deadlock, but log this condition
+		// Note: This may leak resources if the loop is truly stuck
+		fs.logError("fuse loop did not exit before timeout; forcing shutdown", slog.String("mountpoint", fm.mountpoint))
+	}
+
 	C.mockfs_destroy(fm.native)
 	fm.handle.Delete()
 	close(fs.events)
 	fs.platformData = nil
+	fs.logInfo("mockfs closed", slog.String("mountpoint", fm.mountpoint))
+	close(fs.logCh)
 	return nil
 }
 
@@ -289,11 +321,15 @@ func handleToFS(h C.uint64_t) *MockFS {
 func go_getattr(path *C.char, stbuf *C.struct_stat, fi *C.struct_fuse_file_info, handle C.uint64_t) C.int {
 	_ = fi
 	fs := handleToFS(handle)
-	node, err := fs.lookup(C.GoString(path))
+	goPath := C.GoString(path)
+	fs.logTrace("go_getattr start", slog.String("path", goPath))
+	node, err := fs.lookup(goPath)
 	if err != nil {
+		fs.logDebug("go_getattr failed", slog.String("path", goPath), slog.Any("error", err))
 		return -errnoFrom(err)
 	}
 	fillStat(stbuf, node)
+	fs.logTrace("go_getattr success", slog.String("path", goPath))
 	return 0
 }
 
@@ -303,8 +339,11 @@ func go_readdir(path *C.char, buf unsafe.Pointer, filler C.fuse_fill_dir_t, offs
 	_ = offset
 	_ = flags
 	fs := handleToFS(handle)
-	entries, err := fs.list(C.GoString(path))
+	goPath := C.GoString(path)
+	fs.logTrace("go_readdir start", slog.String("path", goPath))
+	entries, err := fs.list(goPath)
 	if err != nil {
+		fs.logDebug("go_readdir failed", slog.String("path", goPath), slog.Any("error", err))
 		return -errnoFrom(err)
 	}
 
@@ -319,6 +358,7 @@ func go_readdir(path *C.char, buf unsafe.Pointer, filler C.fuse_fill_dir_t, offs
 		C.mockfs_call_filler(filler, buf, cname, nil, 0, 0)
 		C.free(unsafe.Pointer(cname))
 	}
+	fs.logTrace("go_readdir success", slog.String("path", goPath), slog.Int("count", len(entries)))
 	return 0
 }
 
@@ -326,14 +366,17 @@ func go_readdir(path *C.char, buf unsafe.Pointer, filler C.fuse_fill_dir_t, offs
 func go_open(path *C.char, fi *C.struct_fuse_file_info, handle C.uint64_t) C.int {
 	fs := handleToFS(handle)
 	goPath := C.GoString(path)
+	fs.logTrace("go_open start", slog.String("path", goPath))
 	fh, _, err := fs.open(goPath)
 	if err != nil {
 		errno := errnoFrom(err)
 		fs.emit(Event{Type: EventOpen, Path: goPath, Error: err, Errno: int(errno)})
+		fs.logDebug("go_open failed", slog.String("path", goPath), slog.Any("error", err))
 		return -errno
 	}
 	fi.fh = C.uint64_t(fh)
 	fs.emit(Event{Type: EventOpen, Path: goPath})
+	fs.logTrace("go_open success", slog.String("path", goPath), slog.Uint64("fh", uint64(fh)))
 	return 0
 }
 
@@ -341,7 +384,9 @@ func go_open(path *C.char, fi *C.struct_fuse_file_info, handle C.uint64_t) C.int
 func go_release(path *C.char, fi *C.struct_fuse_file_info, handle C.uint64_t) C.int {
 	_ = path
 	fs := handleToFS(handle)
+	fs.logTrace("go_release start", slog.Uint64("fh", uint64(fi.fh)))
 	fs.releaseHandle(uint64(fi.fh))
+	fs.logTrace("go_release success", slog.Uint64("fh", uint64(fi.fh)))
 	return 0
 }
 
@@ -349,6 +394,7 @@ func go_release(path *C.char, fi *C.struct_fuse_file_info, handle C.uint64_t) C.
 func go_read(path *C.char, buf *C.char, size C.size_t, offset C.off_t, fi *C.struct_fuse_file_info, handle C.uint64_t) C.int {
 	fs := handleToFS(handle)
 	goPath := C.GoString(path)
+	fs.logTrace("go_read start", slog.String("path", goPath), slog.Int("size", int(size)), slog.Int64("offset", int64(offset)), slog.Uint64("fh", uint64(fi.fh)))
 	var n *node
 	if fhNode, ok := fs.handleNode(uint64(fi.fh)); ok {
 		n = fhNode
@@ -358,6 +404,7 @@ func go_read(path *C.char, buf *C.char, size C.size_t, offset C.off_t, fi *C.str
 		if err != nil {
 			errno := errnoFrom(err)
 			fs.emit(Event{Type: EventRead, Path: goPath, Error: err, Errno: int(errno)})
+			fs.logDebug("go_read lookup failed", slog.String("path", goPath), slog.Any("error", err))
 			return -errno
 		}
 	}
@@ -365,12 +412,14 @@ func go_read(path *C.char, buf *C.char, size C.size_t, offset C.off_t, fi *C.str
 	if err != nil {
 		errno := errnoFrom(err)
 		fs.emit(Event{Type: EventRead, Path: goPath, Error: err, Errno: int(errno)})
+		fs.logDebug("go_read failed", slog.String("path", goPath), slog.Any("error", err))
 		return -errno
 	}
 	if len(data) > 0 {
 		C.memcpy(unsafe.Pointer(buf), unsafe.Pointer(&data[0]), C.size_t(len(data)))
 	}
 	fs.emit(Event{Type: EventRead, Path: goPath, Size: int64(len(data))})
+	fs.logTrace("go_read success", slog.String("path", goPath), slog.Int("read", len(data)), slog.Uint64("fh", uint64(fi.fh)))
 	return C.int(len(data))
 }
 
@@ -378,6 +427,7 @@ func go_read(path *C.char, buf *C.char, size C.size_t, offset C.off_t, fi *C.str
 func go_write(path *C.char, cbuf *C.char, size C.size_t, offset C.off_t, fi *C.struct_fuse_file_info, handle C.uint64_t) C.int {
 	fs := handleToFS(handle)
 	goPath := C.GoString(path)
+	fs.logTrace("go_write start", slog.String("path", goPath), slog.Int("size", int(size)), slog.Int64("offset", int64(offset)), slog.Uint64("fh", uint64(fi.fh)))
 	var n *node
 	if fhNode, ok := fs.handleNode(uint64(fi.fh)); ok {
 		n = fhNode
@@ -387,6 +437,7 @@ func go_write(path *C.char, cbuf *C.char, size C.size_t, offset C.off_t, fi *C.s
 		if err != nil {
 			errno := errnoFrom(err)
 			fs.emit(Event{Type: EventWrite, Path: goPath, Error: err, Errno: int(errno)})
+			fs.logDebug("go_write lookup failed", slog.String("path", goPath), slog.Any("error", err))
 			return -errno
 		}
 	}
@@ -395,9 +446,11 @@ func go_write(path *C.char, cbuf *C.char, size C.size_t, offset C.off_t, fi *C.s
 	if err != nil {
 		errno := errnoFrom(err)
 		fs.emit(Event{Type: EventWrite, Path: goPath, Error: err, Errno: int(errno)})
+		fs.logDebug("go_write failed", slog.String("path", goPath), slog.Any("error", err))
 		return -errno
 	}
 	fs.emit(Event{Type: EventWrite, Path: goPath, Size: int64(written)})
+	fs.logTrace("go_write success", slog.String("path", goPath), slog.Int("written", written), slog.Uint64("fh", uint64(fi.fh)))
 	return C.int(written)
 }
 
@@ -405,20 +458,24 @@ func go_write(path *C.char, cbuf *C.char, size C.size_t, offset C.off_t, fi *C.s
 func go_create(path *C.char, mode C.mode_t, fi *C.struct_fuse_file_info, handle C.uint64_t) C.int {
 	fs := handleToFS(handle)
 	goPath := C.GoString(path)
+	fs.logTrace("go_create start", slog.String("path", goPath), slog.Uint64("mode", uint64(mode)))
 	n, err := fs.createFile(goPath, os.FileMode(mode)&0o777)
 	if err != nil {
 		errno := errnoFrom(err)
 		fs.emit(Event{Type: EventCreate, Path: goPath, Error: err, Errno: int(errno)})
+		fs.logDebug("go_create failed", slog.String("path", goPath), slog.Any("error", err))
 		return -errno
 	}
 	fh, _, err := fs.open(goPath)
 	if err != nil {
 		errno := errnoFrom(err)
 		fs.emit(Event{Type: EventCreate, Path: goPath, Error: err, Errno: int(errno)})
+		fs.logDebug("go_create open failed", slog.String("path", goPath), slog.Any("error", err))
 		return -errno
 	}
 	fi.fh = C.uint64_t(fh)
 	fs.emit(Event{Type: EventCreate, Path: fullPath(n)})
+	fs.logTrace("go_create success", slog.String("path", goPath), slog.Uint64("fh", uint64(fh)))
 	return 0
 }
 
@@ -426,12 +483,15 @@ func go_create(path *C.char, mode C.mode_t, fi *C.struct_fuse_file_info, handle 
 func go_unlink(path *C.char, handle C.uint64_t) C.int {
 	fs := handleToFS(handle)
 	goPath := C.GoString(path)
+	fs.logTrace("go_unlink start", slog.String("path", goPath))
 	if err := fs.unlink(goPath); err != nil {
 		errno := errnoFrom(err)
 		fs.emit(Event{Type: EventRemove, Path: goPath, Error: err, Errno: int(errno)})
+		fs.logDebug("go_unlink failed", slog.String("path", goPath), slog.Any("error", err))
 		return -errno
 	}
 	fs.emit(Event{Type: EventRemove, Path: goPath})
+	fs.logTrace("go_unlink success", slog.String("path", goPath))
 	return 0
 }
 
@@ -439,12 +499,15 @@ func go_unlink(path *C.char, handle C.uint64_t) C.int {
 func go_mkdir(path *C.char, mode C.mode_t, handle C.uint64_t) C.int {
 	fs := handleToFS(handle)
 	goPath := C.GoString(path)
+	fs.logTrace("go_mkdir start", slog.String("path", goPath), slog.Uint64("mode", uint64(mode)))
 	if err := fs.mkdir(goPath, os.FileMode(mode)&0o777); err != nil {
 		errno := errnoFrom(err)
 		fs.emit(Event{Type: EventMkdir, Path: goPath, Error: err, Errno: int(errno)})
+		fs.logDebug("go_mkdir failed", slog.String("path", goPath), slog.Any("error", err))
 		return -errno
 	}
 	fs.emit(Event{Type: EventMkdir, Path: goPath})
+	fs.logTrace("go_mkdir success", slog.String("path", goPath))
 	return 0
 }
 
@@ -452,12 +515,15 @@ func go_mkdir(path *C.char, mode C.mode_t, handle C.uint64_t) C.int {
 func go_rmdir(path *C.char, handle C.uint64_t) C.int {
 	fs := handleToFS(handle)
 	goPath := C.GoString(path)
+	fs.logTrace("go_rmdir start", slog.String("path", goPath))
 	if err := fs.rmdir(goPath); err != nil {
 		errno := errnoFrom(err)
 		fs.emit(Event{Type: EventRmdir, Path: goPath, Error: err, Errno: int(errno)})
+		fs.logDebug("go_rmdir failed", slog.String("path", goPath), slog.Any("error", err))
 		return -errno
 	}
 	fs.emit(Event{Type: EventRmdir, Path: goPath})
+	fs.logTrace("go_rmdir success", slog.String("path", goPath))
 	return 0
 }
 
@@ -467,12 +533,15 @@ func go_rename(oldpath *C.char, newpath *C.char, flags C.uint, handle C.uint64_t
 	fs := handleToFS(handle)
 	oldGo := C.GoString(oldpath)
 	newGo := C.GoString(newpath)
+	fs.logTrace("go_rename start", slog.String("old_path", oldGo), slog.String("new_path", newGo))
 	if err := fs.rename(oldGo, newGo); err != nil {
 		errno := errnoFrom(err)
 		fs.emit(Event{Type: EventRename, Path: newGo, OldPath: oldGo, Error: err, Errno: int(errno)})
+		fs.logDebug("go_rename failed", slog.String("old_path", oldGo), slog.String("new_path", newGo), slog.Any("error", err))
 		return -errno
 	}
 	fs.emit(Event{Type: EventRename, Path: newGo, OldPath: oldGo})
+	fs.logTrace("go_rename success", slog.String("old_path", oldGo), slog.String("new_path", newGo))
 	return 0
 }
 
@@ -481,30 +550,63 @@ func go_truncate(path *C.char, size C.off_t, fi *C.struct_fuse_file_info, handle
 	_ = fi
 	fs := handleToFS(handle)
 	goPath := C.GoString(path)
+	fs.logTrace("go_truncate start", slog.String("path", goPath), slog.Int64("size", int64(size)))
 	if err := fs.truncate(goPath, int64(size)); err != nil {
 		errno := errnoFrom(err)
 		fs.emit(Event{Type: EventTruncate, Path: goPath, Size: int64(size), Error: err, Errno: int(errno)})
+		fs.logDebug("go_truncate failed", slog.String("path", goPath), slog.Any("error", err))
 		return -errno
 	}
 	fs.emit(Event{Type: EventTruncate, Path: goPath, Size: int64(size)})
+	fs.logTrace("go_truncate success", slog.String("path", goPath), slog.Int64("size", int64(size)))
 	return 0
 }
 
 //export go_statfs
 func go_statfs(path *C.char, st *C.struct_statvfs, handle C.uint64_t) C.int {
-	_ = path
-	_ = handle
-	// Return a minimal, mostly static view sufficient for testing.
+	fs := handleToFS(handle)
+	goPath := C.GoString(path)
+	fs.logTrace("go_statfs start", slog.String("path", goPath))
+
+	// Default fallback values if node is not found
+	bsize := C.ulong(4096)
+	frsize := C.ulong(4096)
+	var blocks, bfree, bavail, files, ffree C.ulong = 0, 0, 0, 0, 0
+
+	n, err := fs.lookup(goPath)
+	if err != nil {
+		return -errnoFrom(err)
+	}
+	if n != nil {
+		// total size in "blocks"
+		files = C.ulong(1)
+		blocks = C.ulong(len(n.data)+int(bsize)-1) / bsize
+		bfree = blocks // all blocks "free" (mock)
+		bavail = blocks
+		ffree = files
+	} else {
+		// fallback to 1 block/file
+		files = 1
+		blocks = 1
+		bfree = 1
+		bavail = 1
+		ffree = 1
+	}
+
+	// Zero out struct
 	var zero C.struct_statvfs
 	*st = zero
-	st.f_bsize = 4096
-	st.f_frsize = 4096
-	st.f_blocks = 1024
-	st.f_bfree = 1024
-	st.f_bavail = 1024
-	st.f_files = 1024
-	st.f_ffree = 1024
+
+	st.f_bsize = bsize
+	st.f_frsize = frsize
+	st.f_blocks = blocks
+	st.f_bfree = bfree
+	st.f_bavail = bavail
+	st.f_files = files
+	st.f_ffree = ffree
 	st.f_namemax = 255
+
+	fs.logTrace("go_statfs success", slog.String("path", goPath), slog.Int64("blocks", int64(blocks)), slog.Int64("files", int64(files)))
 	return 0
 }
 

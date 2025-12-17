@@ -50,7 +50,7 @@ func main() {
 	}()
 
 	// Keep running; interact with the mountpoint using normal shell commands.
-	time.Sleep(10 * time.Second)
+	time.Sleep(100 * time.Second)
 }
 ```
 
@@ -58,6 +58,22 @@ Supported operations include `getattr`, `readdir`, `create`, `open`, `read`,
 `write`, `truncate`, `unlink`, `mkdir`, `rmdir`, `rename`, and `statfs`. Events
 are buffered (depth 64) and dropped if the buffer is full. Call `Close` (or
 cancel the context passed to `Mount`) to unmount and clean up.
+
+## Logging
+
+`testfs` uses Go's `slog` for its internal logs. By default it emits text logs to
+`stderr` at `ERROR` level. The library emits trace/debug/info/warn logs for most
+operations; they stay silent until you raise the log level. You can supply your
+own logger (for example to enable info/debug output or change the handler):
+
+```go
+logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+	Level: slog.LevelInfo, // or mockfs.LevelTrace for most verbose output
+}))
+
+fs := mockfs.New()
+fs.SetLogger(logger)
+```
 
 ## Testing manually
 
@@ -104,6 +120,7 @@ Supported error types are:
 - `testfs.ErrNotEmpty` (directory not empty)
 - `testfs.ErrNotFile`  (not a regular file)
 - `testfs.ErrInvalid`  (invalid argument)
+- `nil`                (to not report error but still fail the operation)
 
 You can inject and clear errors at any time during the test to simulate various failure conditions.
 

@@ -2,7 +2,9 @@
 package mockfs
 
 import (
+	"context"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -48,11 +50,18 @@ type Event struct {
 type MockFS struct {
 	treeMu   sync.RWMutex
 	mountMu  sync.Mutex
+	loggerMu sync.RWMutex
 	root     *node
 	events   chan Event
 	handles  map[uint64]*node
 	handleMu sync.Mutex
 	nextFH   uint64
+	logger   *slog.Logger
+	logCh    chan struct {
+		msg   string
+		attrs []any
+		level slog.Level
+	}
 	// platformData is used by platform-specific mount implementations.
 	platformData any
 	errors       map[EventType]error
@@ -77,15 +86,30 @@ var (
 	ErrInvalid  = errors.New("invalid argument")
 )
 
+// LevelTrace is a helper log level below debug for verbose tracing.
+const LevelTrace slog.Level = slog.Level(-8)
+
+func defaultLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+}
+
 // New constructs a mock filesystem with an empty root directory.
 func New() *MockFS {
 	root := newDir("")
-	return &MockFS{
+	fs := &MockFS{
 		root:    root,
 		events:  make(chan Event, 64),
 		handles: make(map[uint64]*node),
 		errors:  make(map[EventType]error),
+		logger:  defaultLogger(),
+		logCh: make(chan struct {
+			msg   string
+			attrs []any
+			level slog.Level
+		}, 1000),
 	}
+
+	return fs
 }
 
 // Events exposes a read-only stream of filesystem events.
@@ -93,12 +117,38 @@ func (fs *MockFS) Events() <-chan Event {
 	return fs.events
 }
 
+// SetLogger overrides the logger used by mockfs. Passing nil resets to the default
+// text logger at error level. Do this only before mounting the filesystem.
+func (fs *MockFS) SetLogger(logger *slog.Logger) {
+	fs.loggerMu.Lock()
+	if logger == nil {
+		fs.logger = defaultLogger()
+	} else {
+		fs.logger = logger
+	}
+	fs.loggerMu.Unlock()
+
+	if logger == nil {
+		fs.logInfo("logger reset to default")
+	} else {
+		fs.logInfo("logger updated")
+	}
+}
+
 // InjectErrorOnEvent injects an error for a specific event type. Thread safe.
+// Set error to nil for the event to succeed but still fail the operation.
 func (fs *MockFS) InjectErrorOnEvent(event EventType, err error) {
 	fs.treeMu.Lock()
 	defer fs.treeMu.Unlock()
 
 	fs.errors[event] = err
+}
+
+// ClearErrorOnEvent clears an error for a specific event type. Thread safe.
+func (fs *MockFS) ClearErrorOnEvent(event EventType) {
+	fs.treeMu.Lock()
+	defer fs.treeMu.Unlock()
+	delete(fs.errors, event)
 }
 
 func newDir(name string) *node {
@@ -201,17 +251,21 @@ func (fs *MockFS) list(path string) ([]*node, error) {
 	fs.treeMu.RLock()
 	defer fs.treeMu.RUnlock()
 
+	fs.logTrace("list start", slog.String("path", path))
 	n, err := fs.lookup(path)
 	if err != nil {
+		fs.logDebug("list failed", slog.String("path", path), slog.Any("error", err))
 		return nil, err
 	}
 	if !n.isDir() {
+		fs.logDebug("list target not dir", slog.String("path", path))
 		return nil, ErrNotDir
 	}
 	entries := make([]*node, 0, len(n.children))
 	for _, child := range n.children {
 		entries = append(entries, child)
 	}
+	fs.logTrace("list success", slog.String("path", path), slog.Int("count", len(entries)))
 	return entries, nil
 }
 
@@ -219,15 +273,19 @@ func (fs *MockFS) open(path string) (uint64, *node, error) {
 	fs.treeMu.RLock()
 	defer fs.treeMu.RUnlock()
 
+	fs.logTrace("open start", slog.String("path", path))
 	if err, ok := fs.errors[EventOpen]; ok {
+		fs.logDebug("open error injected", slog.String("path", path), slog.Any("error", err))
 		return 0, nil, err
 	}
 
 	n, err := fs.lookup(path)
 	if err != nil {
+		fs.logDebug("open failed lookup", slog.String("path", path), slog.Any("error", err))
 		return 0, nil, err
 	}
 	if n.isDir() {
+		fs.logDebug("open target is directory", slog.String("path", path))
 		return 0, nil, ErrIsDir
 	}
 
@@ -235,6 +293,7 @@ func (fs *MockFS) open(path string) (uint64, *node, error) {
 	defer fs.handleMu.Unlock()
 	fs.nextFH++
 	fs.handles[fs.nextFH] = n
+	fs.logTrace("open success", slog.String("path", path), slog.Uint64("fh", fs.nextFH))
 	return fs.nextFH, n, nil
 }
 
@@ -255,18 +314,23 @@ func (fs *MockFS) createFile(path string, mode os.FileMode) (*node, error) {
 	fs.treeMu.Lock()
 	defer fs.treeMu.Unlock()
 
+	fs.logTrace("create start", slog.String("path", path), slog.Any("mode", mode))
 	if err, ok := fs.errors[EventCreate]; ok {
+		fs.logDebug("create error injected", slog.String("path", path), slog.Any("error", err))
 		return nil, err
 	}
 
 	parent, name, err := fs.ensureParent(path)
 	if err != nil {
+		fs.logDebug("create ensureParent failed", slog.String("path", path), slog.Any("error", err))
 		return nil, err
 	}
 	if !parent.isDir() {
+		fs.logDebug("create parent not dir", slog.String("path", path))
 		return nil, ErrNotDir
 	}
 	if _, exists := parent.children[name]; exists {
+		fs.logDebug("create target exists", slog.String("path", path))
 		return nil, ErrExists
 	}
 
@@ -274,6 +338,7 @@ func (fs *MockFS) createFile(path string, mode os.FileMode) (*node, error) {
 	f.parent = parent
 	parent.children[name] = f
 	parent.mtime = time.Now()
+	fs.logTrace("create success", slog.String("path", path), slog.Any("mode", mode))
 	return f, nil
 }
 
@@ -281,18 +346,23 @@ func (fs *MockFS) mkdir(path string, mode os.FileMode) error {
 	fs.treeMu.Lock()
 	defer fs.treeMu.Unlock()
 
+	fs.logTrace("mkdir start", slog.String("path", path), slog.Any("mode", mode))
 	if err, ok := fs.errors[EventMkdir]; ok {
+		fs.logDebug("mkdir error injected", slog.String("path", path), slog.Any("error", err))
 		return err
 	}
 
 	parent, name, err := fs.ensureParent(path)
 	if err != nil {
+		fs.logDebug("mkdir ensureParent failed", slog.String("path", path), slog.Any("error", err))
 		return err
 	}
 	if !parent.isDir() {
+		fs.logDebug("mkdir parent not dir", slog.String("path", path))
 		return ErrNotDir
 	}
 	if _, exists := parent.children[name]; exists {
+		fs.logDebug("mkdir target exists", slog.String("path", path))
 		return ErrExists
 	}
 
@@ -301,6 +371,7 @@ func (fs *MockFS) mkdir(path string, mode os.FileMode) error {
 	d.parent = parent
 	parent.children[name] = d
 	parent.mtime = time.Now()
+	fs.logTrace("mkdir success", slog.String("path", path), slog.Any("mode", mode))
 	return nil
 }
 
@@ -308,23 +379,29 @@ func (fs *MockFS) unlink(path string) error {
 	fs.treeMu.Lock()
 	defer fs.treeMu.Unlock()
 
+	fs.logTrace("unlink start", slog.String("path", path))
 	if err, ok := fs.errors[EventRemove]; ok {
+		fs.logDebug("unlink error injected", slog.String("path", path), slog.Any("error", err))
 		return err
 	}
 
 	parent, name, err := fs.ensureParent(path)
 	if err != nil {
+		fs.logDebug("unlink ensureParent failed", slog.String("path", path), slog.Any("error", err))
 		return err
 	}
 	target, ok := parent.children[name]
 	if !ok {
+		fs.logDebug("unlink target missing", slog.String("path", path))
 		return os.ErrNotExist
 	}
 	if target.isDir() {
+		fs.logDebug("unlink target is dir", slog.String("path", path))
 		return ErrIsDir
 	}
 	delete(parent.children, name)
 	parent.mtime = time.Now()
+	fs.logTrace("unlink success", slog.String("path", path))
 	return nil
 }
 
@@ -332,26 +409,33 @@ func (fs *MockFS) rmdir(path string) error {
 	fs.treeMu.Lock()
 	defer fs.treeMu.Unlock()
 
+	fs.logTrace("rmdir start", slog.String("path", path))
 	if err, ok := fs.errors[EventRmdir]; ok {
+		fs.logDebug("rmdir error injected", slog.String("path", path), slog.Any("error", err))
 		return err
 	}
 
 	parent, name, err := fs.ensureParent(path)
 	if err != nil {
+		fs.logDebug("rmdir ensureParent failed", slog.String("path", path), slog.Any("error", err))
 		return err
 	}
 	target, ok := parent.children[name]
 	if !ok {
+		fs.logDebug("rmdir target missing", slog.String("path", path))
 		return os.ErrNotExist
 	}
 	if !target.isDir() {
+		fs.logDebug("rmdir target not dir", slog.String("path", path))
 		return ErrNotDir
 	}
 	if len(target.children) > 0 {
+		fs.logDebug("rmdir target not empty", slog.String("path", path))
 		return ErrNotEmpty
 	}
 	delete(parent.children, name)
 	parent.mtime = time.Now()
+	fs.logTrace("rmdir success", slog.String("path", path))
 	return nil
 }
 
@@ -359,27 +443,34 @@ func (fs *MockFS) rename(oldPath, newPath string) error {
 	fs.treeMu.Lock()
 	defer fs.treeMu.Unlock()
 
+	fs.logTrace("rename start", slog.String("old_path", oldPath), slog.String("new_path", newPath))
 	if err, ok := fs.errors[EventRename]; ok {
+		fs.logDebug("rename error injected", slog.String("old_path", oldPath), slog.String("new_path", newPath), slog.Any("error", err))
 		return err
 	}
 
 	oldParent, oldName, err := fs.ensureParent(oldPath)
 	if err != nil {
+		fs.logDebug("rename old ensureParent failed", slog.String("old_path", oldPath), slog.Any("error", err))
 		return err
 	}
 	target, ok := oldParent.children[oldName]
 	if !ok {
+		fs.logDebug("rename source missing", slog.String("old_path", oldPath))
 		return os.ErrNotExist
 	}
 
 	newParent, newName, err := fs.ensureParent(newPath)
 	if err != nil {
+		fs.logDebug("rename new ensureParent failed", slog.String("new_path", newPath), slog.Any("error", err))
 		return err
 	}
 	if !newParent.isDir() {
+		fs.logDebug("rename dest parent not dir", slog.String("new_path", newPath))
 		return ErrNotDir
 	}
 	if _, exists := newParent.children[newName]; exists {
+		fs.logDebug("rename dest exists", slog.String("new_path", newPath))
 		return ErrExists
 	}
 
@@ -389,24 +480,30 @@ func (fs *MockFS) rename(oldPath, newPath string) error {
 	newParent.children[newName] = target
 	oldParent.mtime = time.Now()
 	newParent.mtime = time.Now()
+	fs.logTrace("rename success", slog.String("old_path", oldPath), slog.String("new_path", newPath))
 	return nil
 }
 
 func (fs *MockFS) readFile(n *node, offset int64, size int) ([]byte, error) {
+	fs.logTrace("readFile start", slog.Int64("offset", offset), slog.Int("size", size))
 	if offset < 0 || size < 0 {
+		fs.logDebug("readFile invalid args", slog.Int64("offset", offset), slog.Int("size", size))
 		return nil, ErrInvalid
 	}
 	if n.isDir() {
+		fs.logDebug("readFile target is dir")
 		return nil, ErrIsDir
 	}
 	fs.treeMu.RLock()
 	defer fs.treeMu.RUnlock()
 
 	if err, ok := fs.errors[EventRead]; ok {
+		fs.logDebug("readFile error injected", slog.Any("error", err))
 		return nil, err
 	}
 
 	if offset > int64(len(n.data)) {
+		fs.logDebug("readFile offset beyond end", slog.Int64("offset", offset), slog.Int("length", len(n.data)))
 		return []byte{}, nil
 	}
 	end := offset + int64(size)
@@ -414,20 +511,25 @@ func (fs *MockFS) readFile(n *node, offset int64, size int) ([]byte, error) {
 		end = int64(len(n.data))
 	}
 	slice := n.data[offset:end]
+	fs.logTrace("readFile success", slog.Int64("offset", offset), slog.Int("size", len(slice)))
 	return append([]byte(nil), slice...), nil
 }
 
 func (fs *MockFS) writeFile(n *node, data []byte, offset int64) (int, error) {
+	fs.logTrace("writeFile start", slog.Int64("offset", offset), slog.Int("size", len(data)))
 	if offset < 0 {
+		fs.logDebug("writeFile invalid offset", slog.Int64("offset", offset))
 		return 0, ErrInvalid
 	}
 	if n.isDir() {
+		fs.logDebug("writeFile target is dir")
 		return 0, ErrIsDir
 	}
 	fs.treeMu.Lock()
 	defer fs.treeMu.Unlock()
 
 	if err, ok := fs.errors[EventWrite]; ok {
+		fs.logDebug("writeFile error injected", slog.Any("error", err))
 		return 0, err
 	}
 
@@ -439,25 +541,31 @@ func (fs *MockFS) writeFile(n *node, data []byte, offset int64) (int, error) {
 	}
 	copy(n.data[offset:], data)
 	n.mtime = time.Now()
+	fs.logTrace("writeFile success", slog.Int64("offset", offset), slog.Int("size", len(data)))
 	return len(data), nil
 }
 
 func (fs *MockFS) truncate(path string, size int64) error {
+	fs.logTrace("truncate start", slog.String("path", path), slog.Int64("size", size))
 	if size < 0 {
+		fs.logDebug("truncate invalid size", slog.Int64("size", size))
 		return ErrInvalid
 	}
 	fs.treeMu.Lock()
 	defer fs.treeMu.Unlock()
 
 	if err, ok := fs.errors[EventTruncate]; ok {
+		fs.logDebug("truncate error injected", slog.String("path", path), slog.Any("error", err))
 		return err
 	}
 
 	n, err := fs.lookup(path)
 	if err != nil {
+		fs.logDebug("truncate lookup failed", slog.String("path", path), slog.Any("error", err))
 		return err
 	}
 	if n.isDir() {
+		fs.logDebug("truncate target is dir", slog.String("path", path))
 		return ErrIsDir
 	}
 	if size < int64(len(n.data)) {
@@ -467,6 +575,7 @@ func (fs *MockFS) truncate(path string, size int64) error {
 		n.data = append(n.data, padding...)
 	}
 	n.mtime = time.Now()
+	fs.logTrace("truncate success", slog.String("path", path), slog.Int64("size", size))
 	return nil
 }
 
@@ -482,3 +591,25 @@ func (fs *MockFS) emit(ev Event) {
 	default:
 	}
 }
+
+func (fs *MockFS) logLoop() {
+	for rec := range fs.logCh {
+		fs.logger.Log(context.Background(), rec.level, rec.msg, rec.attrs...)
+	}
+}
+
+func (fs *MockFS) log(level slog.Level, msg string, attrs ...any) {
+	if fs.logCh != nil && fs.logger != nil {
+		fs.logCh <- struct {
+			msg   string
+			attrs []any
+			level slog.Level
+		}{msg: msg, attrs: attrs, level: level}
+	}
+}
+
+func (fs *MockFS) logTrace(msg string, attrs ...any) { go fs.log(LevelTrace, msg, attrs...) }
+func (fs *MockFS) logDebug(msg string, attrs ...any) { go fs.log(slog.LevelDebug, msg, attrs...) }
+func (fs *MockFS) logInfo(msg string, attrs ...any)  { go fs.log(slog.LevelInfo, msg, attrs...) }
+func (fs *MockFS) logWarn(msg string, attrs ...any)  { go fs.log(slog.LevelWarn, msg, attrs...) }
+func (fs *MockFS) logError(msg string, attrs ...any) { go fs.log(slog.LevelError, msg, attrs...) }

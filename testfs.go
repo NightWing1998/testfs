@@ -19,6 +19,7 @@ const (
 	EventRmdir    = mockfs.EventRmdir
 	EventOpen     = mockfs.EventOpen
 	EventTruncate = mockfs.EventTruncate
+	LevelTrace    = mockfs.LevelTrace
 )
 
 var (
